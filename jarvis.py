@@ -35,9 +35,10 @@ PRECIOS = {
     "claude-fable-5": {"in": 10.00, "out": 50.00},
 }
 
-# El vault es la raíz del repo de memoria. Este archivo vive en
-# 01-Projects/Jarvis/code/, así que la raíz está 3 niveles arriba.
-VAULT = Path(__file__).resolve().parents[3]
+# El vault es la raíz del repo de memoria. El código canónico vive en
+# ~/Zoey/jarvis (el vault lo ve como 01-Projects/Jarvis/code vía symlink),
+# así que la raíz del vault es una ruta fija, no derivada de __file__.
+VAULT = Path.home() / "Zoey" / "vault"
 INBOX = VAULT / "00-Inbox"
 
 PROMPT_RESUMEN = """\

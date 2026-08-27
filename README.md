@@ -98,9 +98,18 @@ Requirements: macOS on Apple Silicon, Python 3.10+, [Claude Code](https://claude
 
 ```bash
 pip install -r requirements.txt
-python3 jarvis_ui.py <path-to-your-vault>   # full HUD at localhost:7777
-python3 jarvis_voz.py <path-to-your-vault>  # voice only, in the terminal
-python3 jarvis_cli.py <path-to-your-vault>  # text only
+python3 jarvis_ui.py    # full HUD at localhost:7777
+python3 jarvis_voz.py   # voice only, in the terminal
+python3 jarvis_cli.py   # text only
+```
+
+Run these from the repo directory. The vault location is fixed to `~/Zoey/vault`
+(set once in `jarvis_cli.py`). The optional first argument is **not** a vault path
+— it's a project sub-folder inside the vault whose `.md` notes get loaded into
+context on top of the always-on strategy layer:
+
+```bash
+python3 jarvis_cli.py 01-Projects/Jarvis   # + that folder's notes (routed context)
 ```
 
 The first run downloads the models (wake word; Whisper only if used as fallback) and macOS asks for microphone permission — vision additionally needs Screen Recording permission for your terminal. The vault needs a root `CLAUDE.md` with the user's context — the persona is tuned to its original user; adjust `PERSONA` in `jarvis_voz.py` and `RESPELL` for yours. (The assistant speaks Spanish by default — the boot-screen toggle or `?idioma=en` switches everything to English.)

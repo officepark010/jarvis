@@ -31,7 +31,7 @@ from pathlib import Path
 MODEL = "sonnet"
 TIMEOUT = 300  # segundos por llamada
 
-VAULT = Path(__file__).resolve().parents[3]
+VAULT = Path.home() / "Zoey" / "vault"
 INBOX = VAULT / "00-Inbox"
 
 # ── Manos: qué puede HACER Jarvis (allowlist estricta) ────────────────────

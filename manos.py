@@ -26,7 +26,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-VAULT = Path(__file__).resolve().parents[3]
+# El código canónico vive en ~/Zoey/jarvis (el vault lo ve como
+# 01-Projects/Jarvis/code vía symlink), así que la raíz del vault no se
+# deriva de __file__ — es una ruta fija.
+VAULT = Path.home() / "Zoey" / "vault"
 
 DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",

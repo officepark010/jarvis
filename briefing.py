@@ -288,5 +288,5 @@ def datos_briefing(vault: Path, idioma: str = "es") -> tuple[str, str | None]:
 if __name__ == "__main__":
     # prueba directa: python3 briefing.py [ruta-al-vault]
     vault = Path(sys.argv[1]) if len(sys.argv) > 1 else \
-        Path(__file__).resolve().parents[3]
+        Path.home() / "Zoey" / "vault"
     print(PROMPT_BRIEFING["es"].format(datos=datos_briefing(vault)[0]))
