@@ -3016,23 +3016,42 @@ def ejecutar_calendar_create_event_claude(
         "that no event ID was returned."
     )
 
-    # This isolated executor inherits the full JARVIS persona system prompt,
-    # which instructs that create_event may only run after explicit approval
-    # "in this conversation" — but this subprocess cannot see the original
-    # HUD conversation where JARVIS already validated and approved this
-    # exact operation. Append an authorization-boundary addendum (local to
-    # this call only) so the executor treats the supplied parametros as
-    # already-approved instead of refusing for lack of visible approval.
+    # Deliberately NOT the full JARVIS persona (`system`, unused below):
+    # the persona's own MANOS rule requires "an explicit confirmation from
+    # {NOMBRE}" INSIDE the model's own conversation. This subprocess has no
+    # such conversation — inheriting that rule put it in direct conflict
+    # with an appended authorization addendum, and the model refused,
+    # treating the addendum as an injection faking user confirmation (live
+    # E2E failure, 2026-09-17). This worker makes no approval decision, so
+    # it gets no persona rule about approval to be in conflict with in the
+    # first place — a minimal, self-contained prompt instead.
     system_ejecutor = (
-        system
-        + "\n\n"
-        + "AUTHORIZATION BOUNDARY FOR THIS ISOLATED EXECUTION:\n"
-        f"JARVIS has already completed its approval gate for this exact "
-        "operation. The parameters supplied above in APPROVED PARAMETERS "
-        "are the authoritative approved parameters. Do not ask for, or "
-        "independently verify, another conversational approval. Execute "
-        "exactly this one approved Calendar create_event operation. Do not "
-        "perform any other action."
+        "You are a single-purpose Calendar-write execution worker. You "
+        "are not a conversational assistant and have no persona.\n\n"
+        "The OUTER JARVIS process has already completed its own approval "
+        "gate for this exact operation and confirmed it with the user "
+        "before starting you. You have no approval decision to make: do "
+        "not ask for, and do not independently verify, any conversational "
+        "approval — that step already happened outside this process, "
+        "before you existed.\n\n"
+        "APPROVED PARAMETERS (JSON, authoritative — do not modify):\n"
+        f"{json.dumps(parametros, ensure_ascii=False)}\n\n"
+        "Your task, in order:\n"
+        "1. Use ToolSearch with query "
+        "'select:mcp__claude_ai_Google_Calendar__create_event' to load "
+        "the Google Calendar create_event tool.\n"
+        "2. Call mcp__claude_ai_Google_Calendar__create_event exactly "
+        "once, using the APPROVED PARAMETERS above exactly as given.\n"
+        "3. Do not perform any other tool call or action of any kind.\n\n"
+        "End your response with a final line using EXACTLY this format "
+        "(uppercase EVENT_ID, one space after the colon, no Markdown, no "
+        "backticks, nothing else on that line):\n"
+        "EVENT_ID: <event_id>\n"
+        "That line must be the very last line of your response. Use the "
+        "real event ID returned by the tool call — never invent or guess "
+        "one. If the tool call did not return an event ID, do not output "
+        "an EVENT_ID line at all; instead state explicitly that no event "
+        "ID was returned."
     )
 
     # bypassPermissions (not "auto"): "auto" still routes MCP tool calls
