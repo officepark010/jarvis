@@ -3004,8 +3004,16 @@ def ejecutar_calendar_create_event_claude(
         "APPROVED PARAMETERS (JSON):\\n"
         f"{json.dumps(parametros, ensure_ascii=False)}\\n\\n"
         "Call mcp__claude_ai_Google_Calendar__create_event exactly once "
-        "with those parameters. After the tool call, return a concise "
-        "confirmation containing the created event identifier if available."
+        "with those parameters. After the tool call, give a brief "
+        "confirmation, then end your response with a final line using "
+        "EXACTLY this format (uppercase EVENT_ID, one space after the "
+        "colon, no Markdown, no backticks, nothing else on that line):\\n"
+        "EVENT_ID: <event_id>\\n"
+        "That EVENT_ID line must be the very last line of your response. "
+        "Use the real event ID returned by the tool call — never invent "
+        "or guess one. If the tool call did not return an event ID, do "
+        "not output an EVENT_ID line at all; instead state explicitly "
+        "that no event ID was returned."
     )
 
     # This isolated executor inherits the full JARVIS persona system prompt,
@@ -3991,13 +3999,15 @@ def ejecutar_calendar_create_event(
             "parameters": parametros,
         }, session_id
 
-    # Extract the event ID returned by the isolated writer.
+    # Extract the event ID returned by the isolated writer. The writer's
+    # prompt mandates a final "EVENT_ID: <id>" line as the primary,
+    # machine-parsable contract (see ejecutar_calendar_create_event_claude).
     event_id = None
 
     match = re.search(
-        r"\*\*(?:Event\s+ID|ID):\*\*\s*`?([A-Za-z0-9_-]+)`?",
+        r"^EVENT_ID:\s*([A-Za-z0-9_-]+)\s*$",
         respuesta or "",
-        flags=re.IGNORECASE,
+        flags=re.MULTILINE,
     )
     if match:
         event_id = match.group(1)
