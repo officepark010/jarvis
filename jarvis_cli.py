@@ -3035,11 +3035,22 @@ def ejecutar_calendar_create_event_claude(
         "perform any other action."
     )
 
+    # bypassPermissions (not "auto"): "auto" still routes MCP tool calls
+    # through the CLI's interactive permission check, which has no one to
+    # answer it in this headless subprocess — the model then reports back
+    # "permission wasn't granted" instead of executing. That is a SECOND
+    # approval layer on top of JARVIS's own gate, not a safety boundary:
+    # the real boundary here is that --allowedTools/--tools restrict this
+    # process to ToolSearch + the single create_event tool, and JARVIS has
+    # already run validar_accion_pendiente() / revalidar_calendar_aprobado()
+    # / validar_calendar_write_antes_de_ejecutar() before this function is
+    # ever called. bypassPermissions only removes the redundant second
+    # prompt for the one tool this process is capable of calling at all.
     cmd = [
         "claude", "-p", prompt,
         "--output-format", "json",
         "--model", MODEL,
-        "--permission-mode", "auto",
+        "--permission-mode", "bypassPermissions",
         "--permission-prompts", "none",
         "--system-prompt", system_ejecutor,
         "--allowedTools", "ToolSearch", *CALENDAR_CREATE_TOOLS,
