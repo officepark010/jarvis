@@ -42,13 +42,14 @@ from jarvis_cli import (VAULT, cargar_contexto, cargar_wtc_state,
                         clasificar_modo_accion, construir_propuesta_calendar_wtc,
                         crear_solicitud_aprobacion, detectar_cancelacion,
                         detectar_confirmacion, detectar_intencion,
-                        ejecutar_calendar_create_event, es_pedido_wtc_source_scan,
+                        ejecutar_calendar_create_event, ejecutar_gmail_create_draft,
+                        es_pedido_wtc_source_scan,
                         es_pedido_wtc_updates, escribir_memoria,
                         establecer_accion_pendiente, extraer_parametros_accion,
                         obtener_wtc_source_scan, obtener_wtc_updates,
                         planificar_accion_seca, preguntar_stream,
                         resolver_tiempos_calendar, validar_accion_pendiente,
-                        validar_calendar_write)
+                        validar_calendar_write, validar_gmail_create_draft)
 from jarvis_voz import (DESPEDIDAS, RESPELL, SAMPLE_RATE, VOZ_RATE, YAP,
                         _limpiar_para_voz, persona, transcribir, voz_para)
 from perfil import (IDIOMAS_ONBOARDING, IDIOMAS_SOPORTADOS, TRATAMIENTOS,
@@ -1004,6 +1005,62 @@ def stream():
                 # Neither confirm nor cancel: fall through to normal
                 # conversation: the proposal stays pending for a later turn.
 
+            # ── Generic Gmail CREATE-DRAFT confirmation bridge ──────────
+            # Mirrors the generic Calendar CREATE confirmation bridge
+            # above exactly — services a pending Gmail create_draft
+            # proposal built from an ordinary conversational request (see
+            # the detection block further below), using the SAME
+            # unmodified primitives (detectar_confirmacion /
+            # validar_accion_pendiente / ejecutar_gmail_create_draft /
+            # detectar_cancelacion) the standalone terminal REPL already
+            # uses. Never a second execution path, never a direct Gmail
+            # MCP call from this file — only a second producer for
+            # S["gmail_pending_action"]. create_draft is not in
+            # MANOS_TOOLS: this bridge, plus the terminal REPL's own
+            # confirmation gate, are the ONLY paths that can ever call
+            # ejecutar_gmail_create_draft().
+            if S.get("gmail_pending_action") is not None:
+                # Same entrada_original note as the Calendar bridge above.
+                if detectar_confirmacion(entrada_original):
+                    plan_pendiente = S["gmail_pending_action"]
+                    S["gmail_pending_action"] = None
+                    resumen = plan_pendiente.get("parameters", {}).get(
+                        "subject", "the draft")
+                    if validar_accion_pendiente(plan_pendiente):
+                        try:
+                            resultado, _ = ejecutar_gmail_create_draft(
+                                plan_pendiente, S["system"], None, execute=True)
+                        except Exception as e:
+                            resultado = {"status": "failed", "reason": str(e)}
+                        estado = resultado.get("status")
+                        if estado == "executed":
+                            draft_id = resultado.get("draft_id")
+                            respuesta = (
+                                f'Done — created the draft "{resumen}"'
+                                + (f" (draft ID {draft_id})." if draft_id else ".")
+                            )
+                        elif estado == "blocked":
+                            respuesta = (f'I couldn\'t create the draft "{resumen}" — '
+                                         f'{resultado.get("reason", "blocked by a safety check")}.')
+                        else:
+                            respuesta = (f'That Gmail draft didn\'t go through — '
+                                         f'{resultado.get("reason", "unknown error")}.')
+                    else:
+                        respuesta = "That proposal is no longer valid — please ask again."
+                    yield _sse({"tipo": "oracion", "texto": respuesta})
+                    yield _sse({"tipo": "fin", "texto": respuesta})
+                    return
+
+                # Same cancel detection the Calendar bridge above already uses.
+                if detectar_cancelacion(entrada_original):
+                    S["gmail_pending_action"] = None
+                    respuesta = "Okay, I won't create that Gmail draft."
+                    yield _sse({"tipo": "oracion", "texto": respuesta})
+                    yield _sse({"tipo": "fin", "texto": respuesta})
+                    return
+                # Neither confirm nor cancel: fall through to normal
+                # conversation: the proposal stays pending for a later turn.
+
             # ── Generic Calendar CREATE detection (additive) ────────────
             # Services an ordinary conversational "create a calendar
             # event…" request the same way the standalone terminal REPL
@@ -1050,6 +1107,46 @@ def stream():
                     # duration/end time, etc.): no pending write is
                     # created here — falls through to normal conversation
                     # below so the model can ask for what's missing.
+
+            # ── Generic Gmail CREATE-DRAFT detection (additive) ─────────
+            # Mirrors the generic Calendar CREATE detection block above
+            # exactly — services an ordinary conversational "draft an
+            # email…" request the same way the standalone terminal REPL
+            # already does (jarvis_cli.py main(), the pending_action
+            # block) — same unmodified planner/validator functions, same
+            # pending-action shape, same explicit-confirmation gate.
+            # create_draft is NOT in MANOS_TOOLS: this never calls it
+            # directly, it only ever populates S["gmail_pending_action"],
+            # which the confirmation bridge above requires an explicit
+            # "yes" to act on next turn. An incomplete/unresolvable
+            # request leaves no pending action and falls through to
+            # normal conversation, which can ask for the missing details.
+            if (
+                S.get("gmail_pending_action") is None
+                and detectar_intencion(entrada_original) == "email"
+            ):
+                plan_gmail = planificar_accion_seca(entrada_original, "email")
+                plan_gmail = clasificar_modo_accion(plan_gmail)
+                plan_gmail = extraer_parametros_accion(entrada_original, plan_gmail)
+
+                if (
+                    plan_gmail.get("action") == "create_draft"
+                    and plan_gmail.get("mode") == "write"
+                    and plan_gmail.get("approval") == "required"
+                ):
+                    validacion_gmail = validar_gmail_create_draft(plan_gmail)
+                    if validacion_gmail.get("valid"):
+                        pendiente_gmail = establecer_accion_pendiente(plan_gmail)
+                        if validar_accion_pendiente(pendiente_gmail):
+                            S["gmail_pending_action"] = pendiente_gmail
+                            respuesta = crear_solicitud_aprobacion(pendiente_gmail)
+                            yield _sse({"tipo": "oracion", "texto": respuesta})
+                            yield _sse({"tipo": "fin", "texto": respuesta})
+                            return
+                    # Incomplete or unresolved (missing to/subject/body):
+                    # no pending write is created here — falls through to
+                    # normal conversation below so the model can ask for
+                    # what's missing.
 
             if es_pedido_wtc_updates(entrada):
                 # Dedicated, narrow, READ-ONLY "check WTC updates" path.
