@@ -3421,23 +3421,61 @@ def verificar_calendar_evento_antes_de_eliminar_claude(
 
     prompt = (
         "VERIFY ONE GOOGLE CALENDAR EVENT BEFORE DELETION — READ ONLY.\n\n"
+        "First, use ToolSearch with query "
+        "'select:mcp__claude_ai_Google_Calendar__get_event' to load the "
+        "Google Calendar get_event tool.\n"
         f"Retrieve ONLY event ID: {event_id}\n"
         f"Use calendar ID: {calendar_id}\n"
         "Do not create, update, delete, search, or modify any event.\n"
         "Use ONLY the Google Calendar get_event tool.\n\n"
-        "After the tool call, return ONLY the native event object as valid JSON."
+        "After the tool call, respond with ONLY the native event object "
+        "as valid JSON — no prose, no Markdown, no commentary, nothing "
+        "else in the response."
+    )
+
+    # Deliberately NOT the full JARVIS persona (`system`, unused below) —
+    # same root cause and same fix as ejecutar_calendar_create_event_claude()
+    # / ejecutar_calendar_delete_event_claude(): the persona's conversational
+    # voice competed with "return ONLY valid JSON," so this read-only
+    # verifier unreliably answered in prose instead (live failures,
+    # 2026-09-18). A minimal, self-contained prompt has no such competing
+    # instruction.
+    system_ejecutor = (
+        "You are a single-purpose, read-only Calendar-verification "
+        "worker. You are not a conversational assistant and have no "
+        "persona.\n\n"
+        "The OUTER JARVIS process is using you to verify one exact "
+        "Calendar event before a deletion it has already approved "
+        "outside this process. You make no approval decision, and you "
+        "perform no write of any kind.\n\n"
+        "TARGET (JSON, authoritative — do not modify):\n"
+        f"{json.dumps({'eventId': event_id, 'calendarId': calendar_id}, ensure_ascii=False)}\n\n"
+        "Your task, in order:\n"
+        "1. Use ToolSearch with query "
+        "'select:mcp__claude_ai_Google_Calendar__get_event' to load the "
+        "Google Calendar get_event tool.\n"
+        "2. Call mcp__claude_ai_Google_Calendar__get_event exactly once "
+        "for the TARGET event ID and calendar ID above.\n"
+        "3. Do not perform any other tool call or action of any kind.\n\n"
+        "Respond with ONLY the native event object returned by "
+        "get_event, as valid JSON — no prose, no Markdown, no "
+        "commentary, nothing else in the response. If get_event fails "
+        "or the event cannot be found, respond with ONLY this exact "
+        "JSON object instead:\n"
+        '{"error": "not_found"}'
     )
 
     cmd = [
         "claude", "-p", prompt,
         "--output-format", "json",
         "--model", MODEL,
-        "--permission-mode", "auto",
-        "--append-system-prompt", system,
+        "--permission-mode", "bypassPermissions",
+        "--permission-prompts", "none",
+        "--system-prompt", system_ejecutor,
         "--allowedTools",
-        "mcp__claude_ai_Google_Calendar__get_event",
+        "ToolSearch", "mcp__claude_ai_Google_Calendar__get_event",
         "--tools",
-        "mcp__claude_ai_Google_Calendar__get_event",
+        "ToolSearch", "mcp__claude_ai_Google_Calendar__get_event",
         "--add-dir", str(VAULT),
     ]
 
@@ -3562,28 +3600,67 @@ def verificar_calendar_evento_eliminado_claude(
 
     prompt = (
         "VERIFY GOOGLE CALENDAR EVENT DELETION — READ ONLY.\n\n"
+        "First, use ToolSearch with query "
+        "'select:mcp__claude_ai_Google_Calendar__get_event' to load the "
+        "Google Calendar get_event tool.\n"
         f"Retrieve ONLY event ID: {event_id}\n"
         f"Use calendar ID: {calendar_id}\n"
         "Do not create, update, delete, search, or modify any event.\n"
         "Use ONLY the Google Calendar get_event tool.\n\n"
         "The expected result is that the event no longer exists.\n"
-        "If get_event reports that the event is not found, return exactly:\n"
+        "If get_event reports that the event is not found, respond with "
+        "ONLY this exact JSON, nothing else:\n"
         '{"deleted": true, "eventId": "' + event_id + '"}\n'
-        "If the event still exists, return exactly:\n"
+        "If the event still exists, respond with ONLY this exact JSON, "
+        "nothing else:\n"
         '{"deleted": false, "eventId": "' + event_id + '"}\n'
-        "Return only valid JSON."
+        "Respond with ONLY that JSON — no prose, no Markdown, no "
+        "commentary, nothing else in the response."
+    )
+
+    # Deliberately NOT the full JARVIS persona (`system`, unused below) —
+    # same fix as the pre-delete verifier above and the isolated
+    # create/delete executors: removes the competing conversational
+    # instruction that caused unreliable prose-instead-of-JSON replies.
+    system_ejecutor = (
+        "You are a single-purpose, read-only Calendar-verification "
+        "worker. You are not a conversational assistant and have no "
+        "persona.\n\n"
+        "The OUTER JARVIS process is using you to independently confirm "
+        "one exact Calendar event was deleted, after a deletion it "
+        "already approved and executed outside this process. You make "
+        "no approval decision, and you perform no write of any kind.\n\n"
+        "TARGET (JSON, authoritative — do not modify):\n"
+        f"{json.dumps({'eventId': event_id, 'calendarId': calendar_id}, ensure_ascii=False)}\n\n"
+        "Your task, in order:\n"
+        "1. Use ToolSearch with query "
+        "'select:mcp__claude_ai_Google_Calendar__get_event' to load the "
+        "Google Calendar get_event tool.\n"
+        "2. Call mcp__claude_ai_Google_Calendar__get_event exactly once "
+        "for the TARGET event ID and calendar ID above.\n"
+        "3. Do not perform any other tool call or action of any kind.\n\n"
+        "The expected result is that the event no longer exists. If "
+        "get_event reports that the event is not found, respond with "
+        "ONLY this exact JSON, nothing else:\n"
+        '{"deleted": true, "eventId": "' + event_id + '"}\n'
+        "If the event still exists, respond with ONLY this exact JSON, "
+        "nothing else:\n"
+        '{"deleted": false, "eventId": "' + event_id + '"}\n'
+        "Respond with ONLY that JSON — no prose, no Markdown, no "
+        "commentary, nothing else in the response."
     )
 
     cmd = [
         "claude", "-p", prompt,
         "--output-format", "json",
         "--model", MODEL,
-        "--permission-mode", "auto",
-        "--append-system-prompt", system,
+        "--permission-mode", "bypassPermissions",
+        "--permission-prompts", "none",
+        "--system-prompt", system_ejecutor,
         "--allowedTools",
-        "mcp__claude_ai_Google_Calendar__get_event",
+        "ToolSearch", "mcp__claude_ai_Google_Calendar__get_event",
         "--tools",
-        "mcp__claude_ai_Google_Calendar__get_event",
+        "ToolSearch", "mcp__claude_ai_Google_Calendar__get_event",
         "--add-dir", str(VAULT),
     ]
 
