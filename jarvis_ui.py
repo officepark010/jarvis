@@ -22,9 +22,11 @@ Uso:
 """
 
 import asyncio
+from datetime import datetime
 import json
 import re
 import sys
+import subprocess
 import tempfile
 import threading
 import time
@@ -40,6 +42,7 @@ from briefing import (PROMPT_BRIEFING, TITULOS, _clima, datos_briefing,
                       limpiar_markdown, secciones_briefing)
 from jarvis_cli import (VAULT, cargar_contexto, cargar_wtc_state,
                         clasificar_modo_accion, construir_propuesta_calendar_wtc,
+                        construir_propuesta_recordatorio_wtc,
                         crear_solicitud_aprobacion, detectar_cancelacion,
                         detectar_confirmacion, detectar_intencion,
                         ejecutar_calendar_create_event, ejecutar_gmail_create_draft,
@@ -147,6 +150,7 @@ S = {
     "idioma": "es",         # idioma de la UI — el oído transcribe en este idioma
     "tratamiento": "Ma'am", # "Sir" o "Ma'am" — cómo te llama Jarvis (perfil por-usuario)
     "clima": {"es": None, "en": None, "ml": None},  # en TODOS los idiomas
+    "wtc_pending_reminder": None,  # explicit-confirmation WTC date reminder
                             # (refresco cada 45 min): el HUD muestra el del
                             # toggle actual, no el del fetch
     "paneles": [],          # tarjetas situacionales del HUD {id,tipo,lineas,ts,ttl}
@@ -791,6 +795,69 @@ def mic_stop():
     return jsonify({"texto": texto})
 
 
+def ejecutar_recordatorio_wtc(plan: dict) -> dict:
+    """Execute a validated WTC persistent date reminder.
+
+    Uses the existing local `manos.py recordar` hand rather than exposing
+    arbitrary shell execution to the normal HUD conversation.
+    """
+    parameters = plan.get("parameters") or {}
+    texto = parameters.get("text")
+    fecha = parameters.get("date")
+
+    if not isinstance(texto, str) or not texto.strip():
+        return {"status": "blocked", "reason": "missing reminder text"}
+
+    if not isinstance(fecha, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", fecha):
+        return {"status": "blocked", "reason": "invalid reminder date"}
+
+    try:
+        datetime.strptime(fecha, "%Y-%m-%d")
+    except ValueError:
+        return {"status": "blocked", "reason": "invalid reminder date"}
+
+    if fecha < datetime.now().strftime("%Y-%m-%d"):
+        return {"status": "blocked", "reason": "reminder date is in the past"}
+
+    nota = VAULT / "00-Inbox" / "Recordatorios-Jarvis.md"
+
+    try:
+        before = nota.read_text(encoding="utf-8") if nota.exists() else ""
+
+        proc = subprocess.run(
+            ["python3", "manos.py", "recordar", texto.strip(), fecha],
+            cwd=str(AQUI),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"status": "failed", "reason": str(exc)}
+
+    if proc.returncode != 0:
+        reason = (proc.stderr or proc.stdout or "reminder command failed").strip()
+        return {"status": "failed", "reason": reason}
+
+    try:
+        after = nota.read_text(encoding="utf-8") if nota.exists() else ""
+    except OSError as exc:
+        return {"status": "failed", "reason": f"could not verify reminder: {exc}"}
+
+    expected = f"- [ ] {fecha} — {texto.strip()}\n"
+    if expected not in after:
+        return {
+            "status": "failed",
+            "reason": "reminder command succeeded but persistence verification failed",
+        }
+
+    return {
+        "status": "executed",
+        "date": fecha,
+        "text": texto.strip(),
+    }
+
+
 @app.post("/api/stream")
 def stream():
     """Un turno del loop, en vivo. SSE con eventos:
@@ -899,6 +966,54 @@ def stream():
                 return
 
             # ── HUD Calendar confirmation bridge ────────────────────────
+            # WTC persistent-reminder confirmation bridge.
+            # Date-only WTC candidates use the existing persistent
+            # `manos.py recordar` mechanism; no Calendar write is involved.
+            if S.get("wtc_pending_reminder") is not None:
+                if detectar_confirmacion(entrada_original):
+                    plan_pendiente = S["wtc_pending_reminder"]
+                    S["wtc_pending_reminder"] = None
+
+                    if validar_accion_pendiente(plan_pendiente):
+                        resultado = ejecutar_recordatorio_wtc(plan_pendiente)
+                        estado = resultado.get("status")
+
+                        if estado == "executed":
+                            fecha = resultado.get("date", "")
+                            texto = resultado.get("text", "")
+                            respuesta = (
+                                f'Done — saved the WTC reminder for {fecha}: '
+                                f'"{texto}".'
+                            )
+                        elif estado == "blocked":
+                            respuesta = (
+                                "I couldn't save that WTC reminder — "
+                                f'{resultado.get("reason", "blocked by a safety check")}.'
+                            )
+                        else:
+                            respuesta = (
+                                "That WTC reminder didn't go through — "
+                                f'{resultado.get("reason", "unknown error")}.'
+                            )
+                    else:
+                        respuesta = (
+                            "That reminder proposal is no longer valid — "
+                            "run the WTC check again."
+                        )
+
+                    yield _sse({"tipo": "oracion", "texto": respuesta})
+                    yield _sse({"tipo": "fin", "texto": respuesta})
+                    return
+
+                if detectar_cancelacion(entrada_original):
+                    S["wtc_pending_reminder"] = None
+                    respuesta = "Okay, I won't save that WTC reminder."
+                    yield _sse({"tipo": "oracion", "texto": respuesta})
+                    yield _sse({"tipo": "fin", "texto": respuesta})
+                    return
+
+                # Neither confirm nor cancel: leave the proposal pending.
+
             # Completes the existing Calendar approval flow for a WTC
             # source-scan proposal without ever granting a Calendar write
             # tool to a normal conversation turn. Reuses the SAME
@@ -1175,8 +1290,11 @@ def stream():
                 # ever sets S["wtc_pending_calendar"], which the
                 # confirmation bridge above requires an explicit "yes" to
                 # act on next turn.
+                state = cargar_wtc_state()
                 S["wtc_pending_calendar"] = construir_propuesta_calendar_wtc(
-                    cargar_wtc_state())
+                    state)
+                S["wtc_pending_reminder"] = construir_propuesta_recordatorio_wtc(
+                    state)
                 yield _sse({"tipo": "oracion", "texto": respuesta})
                 yield _sse({"tipo": "fin", "texto": respuesta})
                 return

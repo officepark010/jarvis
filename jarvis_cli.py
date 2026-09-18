@@ -1134,6 +1134,68 @@ def seleccionar_candidato_calendar_wtc(state: dict | None) -> dict | None:
     return sorted(elegibles, key=lambda c: (c["date"], c["start_time"]))[0]
 
 
+
+def seleccionar_candidato_recordatorio_wtc(state: dict | None) -> dict | None:
+    """Pick the nearest future WTC source candidate eligible for a
+    persistent date reminder.
+
+    Date-only candidates are eligible here; a Calendar time is not required.
+    Only CONFIRMED_CANDIDATE entries with an explicit future/today date are
+    considered. No date is invented.
+    """
+    if not state:
+        return None
+
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    elegibles = [
+        c for c in state.get("source_candidates", [])
+        if c.get("extraction_status") == "CONFIRMED_CANDIDATE"
+        and c.get("date")
+        and not c.get("start_time")
+        and c["date"] >= hoy
+    ]
+    if not elegibles:
+        return None
+
+    return sorted(
+        elegibles,
+        key=lambda c: (c["date"], c.get("start_time") or "99:99"),
+    )[0]
+
+
+def construir_propuesta_recordatorio_wtc(
+    state: dict | None,
+) -> dict | None:
+    """Build a dry-run persistent-reminder proposal from a WTC candidate.
+
+    Never executes manos.py. The caller must obtain explicit confirmation
+    before executing the existing persistent reminder hand.
+    """
+    candidato = seleccionar_candidato_recordatorio_wtc(state)
+    if not candidato:
+        return None
+
+    fecha = candidato.get("date")
+    titulo = candidato.get("title") or "WTC reminder"
+    fuente = candidato.get("source_path", "")
+    if not fecha or not fuente:
+        return None
+
+    texto = f"{titulo} — fuente: {fuente}"
+
+    return crear_plan_accion(
+        intent="reminder",
+        action="create_reminder",
+        target=titulo,
+        parameters={
+            "text": texto,
+            "date": fecha,
+            "source_path": fuente,
+        },
+        mode="write",
+        approval="required",
+    )
+
 def construir_plan_calendar_wtc(candidato: dict) -> dict | None:
     """Build a Calendar create_event plan from one WTC source candidate.
 
