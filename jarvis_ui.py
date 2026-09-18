@@ -25,6 +25,7 @@ import asyncio
 import json
 import re
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -37,13 +38,96 @@ from flask import Flask, Response, jsonify, request, send_file
 
 from briefing import (PROMPT_BRIEFING, TITULOS, _clima, datos_briefing,
                       limpiar_markdown, secciones_briefing)
-from jarvis_cli import (VAULT, cargar_contexto, escribir_memoria,
-                        preguntar_stream)
-from jarvis_voz import (PERSONA, RESPELL, SAMPLE_RATE, VOZ, VOZ_RATE, YAP,
-                        _limpiar_para_voz, transcribir)
+from jarvis_cli import (VAULT, cargar_contexto, cargar_wtc_state,
+                        clasificar_modo_accion, construir_propuesta_calendar_wtc,
+                        crear_solicitud_aprobacion, detectar_cancelacion,
+                        detectar_confirmacion, detectar_intencion,
+                        ejecutar_calendar_create_event, es_pedido_wtc_source_scan,
+                        es_pedido_wtc_updates, escribir_memoria,
+                        establecer_accion_pendiente, extraer_parametros_accion,
+                        obtener_wtc_source_scan, obtener_wtc_updates,
+                        planificar_accion_seca, preguntar_stream,
+                        resolver_tiempos_calendar, validar_accion_pendiente,
+                        validar_calendar_write)
+from jarvis_voz import (DESPEDIDAS, RESPELL, SAMPLE_RATE, VOZ_RATE, YAP,
+                        _limpiar_para_voz, persona, transcribir, voz_para)
+from perfil import (IDIOMAS_ONBOARDING, IDIOMAS_SOPORTADOS, TRATAMIENTOS,
+                    cargar_perfil, guardar_perfil, idioma_actual, nombre_actual,
+                    tratamiento_actual, tratamiento_para)
 
 app = Flask(__name__)
 AQUI = Path(__file__).resolve().parent
+
+def listar_ventanas_visibles() -> list[dict]:
+    """Lista ventanas de aplicaciones visibles mediante CoreGraphics nativo."""
+    script = r'''
+import CoreGraphics
+import Foundation
+
+let windows = CGWindowListCopyWindowInfo(
+    [.optionOnScreenOnly, .excludeDesktopElements],
+    kCGNullWindowID
+) as! [[String: Any]]
+
+var result: [[String: Any]] = []
+
+for w in windows {
+    guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0 else {
+        continue
+    }
+
+    guard let windowID = w[kCGWindowNumber as String] as? Int else {
+        continue
+    }
+
+    let owner = (w[kCGWindowOwnerName as String] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let title = (w[kCGWindowName as String] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+    guard !owner.isEmpty else {
+        continue
+    }
+
+    result.append([
+        "window_id": windowID,
+        "app": owner,
+        "title": title,
+    ])
+}
+
+let data = try JSONSerialization.data(withJSONObject: result)
+print(String(data: data, encoding: .utf8)!)
+'''
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["swift", "-e", script],
+            cwd=str(AQUI),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise RuntimeError(f"native window enumeration failed: {exc}") from exc
+
+    try:
+        ventanas = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("native window enumeration returned invalid JSON") from exc
+
+    return [
+        {
+            "window_id": int(v["window_id"]),
+            "app": str(v["app"]),
+            "title": str(v.get("title", "")),
+        }
+        for v in ventanas
+        if isinstance(v, dict)
+        and "window_id" in v
+        and "app" in v
+    ]
+
 
 # Estado global de la sesión (la UI es single-user: es tu Mac)
 S = {
@@ -60,8 +144,10 @@ S = {
     "avisos": [],           # timers vencidos etc. — el browser los recoge y los dice
     "timers": [],           # timers activos {fin, etiqueta} — el HUD los muestra en vivo
     "idioma": "es",         # idioma de la UI — el oído transcribe en este idioma
-    "clima": {"es": None, "en": None},  # en AMBOS idiomas (refresco cada 45 min):
-                            # el HUD muestra el del toggle actual, no el del fetch
+    "tratamiento": "Ma'am", # "Sir" o "Ma'am" — cómo te llama Jarvis (perfil por-usuario)
+    "clima": {"es": None, "en": None, "ml": None},  # en TODOS los idiomas
+                            # (refresco cada 45 min): el HUD muestra el del
+                            # toggle actual, no el del fetch
     "paneles": [],          # tarjetas situacionales del HUD {id,tipo,lineas,ts,ttl}
     "paneles_seq": 0,
     "lock": threading.Lock(),
@@ -72,12 +158,101 @@ S = {
 _ORACION = re.compile(r"(.+?[.!?…])(?:\s+|$)", re.S)
 
 # Primer bocado: se corta en la primera cláusula (coma, etc.) para que la voz
-# arranque antes — pero NUNCA justo antes del nombre: si "Charles" cae al
+# arranque antes — pero NUNCA justo antes del nombre: si "Ma'am" cae al
 # inicio del pedazo siguiente, la coma queda en el pedazo anterior, el
 # respelling de _limpiar_para_voz no la ve y el gap entre audios suena como
 # la pausa robótica que vinimos a matar.
 _PRIMER_BOCADO = re.compile(
     rf"(.{{15,}}?[,;:.!?…])\s+(?!(?:{'|'.join(RESPELL)})\b)", re.S)
+
+
+def seleccionar_ventana(window_id: int) -> dict | None:
+    """Selecciona una ventana visible de una enumeración fresca."""
+    try:
+        target_id = int(window_id)
+    except (TypeError, ValueError):
+        return None
+
+    for ventana in listar_ventanas_visibles():
+        if ventana.get("window_id") == target_id:
+            return ventana
+    return None
+
+
+def validar_ventana_para_captura(ventana: dict | None) -> int | None:
+    """Valida que una ventana seleccionada siga visible antes de capturarla."""
+    if not isinstance(ventana, dict):
+        return None
+
+    window_id = ventana.get("window_id")
+    if not isinstance(window_id, int):
+        return None
+
+    seleccionada = seleccionar_ventana(window_id)
+    if seleccionada is None:
+        return None
+
+    return window_id
+
+
+def preparar_datos_picker_ventanas() -> list[dict]:
+    """Prepara opciones seguras y legibles para el selector de ventanas."""
+    opciones = []
+    for ventana in listar_ventanas_visibles():
+        app = ventana.get("app", "").strip()
+        title = ventana.get("title", "").strip()
+        if not app:
+            continue
+        label = f"{app} — {title}" if title else app
+        opciones.append({
+            "window_id": ventana["window_id"],
+            "app": app,
+            "title": title,
+            "label": label,
+        })
+    return opciones
+
+
+def capturar_ventana_seleccionada(ventana: dict | None) -> Path:
+    """Captura únicamente una ventana previamente validada."""
+    window_id = validar_ventana_para_captura(ventana)
+    if window_id is None:
+        raise ValueError("selected window is no longer valid")
+
+    tmp = tempfile.NamedTemporaryFile(prefix="jarvis-window-", suffix=".png", delete=False)
+    destino = Path(tmp.name)
+    tmp.close()
+
+    try:
+        import subprocess
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["screencapture", "-x", f"-l{window_id}", str(destino)],
+                cwd=str(AQUI),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        else:
+            # Windows/Linux (agregado para el port de Windows): captura.py
+            # es el equivalente multiplataforma de `screencapture -l<id>`.
+            # No cambia nada del camino de Mac de arriba.
+            from captura import capturar_ventana
+            capturar_ventana(destino, window_id)
+        if not destino.is_file() or destino.stat().st_size == 0:
+            try:
+                destino.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RuntimeError("window capture produced no image")
+        return destino
+    except (subprocess.SubprocessError, OSError) as exc:
+        try:
+            destino.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(f"window capture failed: {exc}") from exc
 
 
 def _sse(datos: dict) -> str:
@@ -107,8 +282,57 @@ def panel(tipo: str, lineas: list[str], ttl: int = 30) -> None:
 def _err_ocupado(idioma: str) -> str:
     # los errores visibles en la UI se componen en el idioma del toggle
     # (mismo patrón que el aviso de timer y la despedida, sesión 33)
-    return ("busy — wait for the current turn" if idioma == "en"
-            else "ocupado, esperá el turno actual")
+    # NOTE: "ml" text machine-drafted — review with a native speaker
+    return {
+        "en": "busy — wait for the current turn",
+        "ml": "തിരക്കിലാണ് — ഇപ്പോഴത്തെ ടേൺ കഴിയുന്നത് വരെ കാത്തിരിക്കൂ",
+    }.get(idioma, "ocupado, esperá el turno actual")
+
+
+_PEDIDOS_SALIDA = {
+    "salir", "/salir",
+    "exit", "quit",
+    "bye", "goodbye", "good bye",
+    "stop the conversation", "end the conversation",
+    "let's end this", "lets end this",
+    "we're done", "were done",
+    "stop talking",
+}
+
+
+def es_pedido_salida(texto: str) -> bool:
+    """Detect a natural-language request to end the current conversation.
+
+    Conservative exact/normalized matching only (same discipline as
+    es_pedido_wtc_updates in jarvis_cli.py) — deliberately does NOT match
+    on the bare word "stop", so "stop the timer", "stop listening", "stop
+    playing" etc. keep their existing meaning and fall through to normal
+    conversation.
+    """
+    t = " ".join((texto or "").strip().lower().split())
+    t = t.replace("’", "'").rstrip("!.?").strip()
+    return t in _PEDIDOS_SALIDA
+
+
+def _texto_despedida(idioma: str, tratamiento: str) -> str:
+    """Localized goodbye text once session memory is saved — shared by
+    /api/salir and the natural-language exit path in gen()."""
+    t_addr = tratamiento_para(idioma, tratamiento)
+    # NOTE: "ml" text machine-drafted — review with a native speaker
+    return {
+        "en": f"Session memory saved to the vault, {t_addr}.",
+        "ml": f"സെഷൻ മെമ്മറി വോൾട്ടിൽ സേവ് ചെയ്തു, {t_addr}.",
+    }.get(idioma, f"Memoria de sesión guardada en el vault, {t_addr}.")
+
+
+def _texto_sin_sesion(idioma: str, tratamiento: str) -> str:
+    """Graceful reply when an exit phrase arrives with no active session."""
+    t_addr = tratamiento_para(idioma, tratamiento)
+    # NOTE: "ml" text machine-drafted — review with a native speaker
+    return {
+        "en": f"No active session to close, {t_addr}.",
+        "ml": f"അവസാനിപ്പിക്കാൻ സെഷൻ ഒന്നും സജീവമല്ല, {t_addr}.",
+    }.get(idioma, f"No hay ninguna sesión activa para cerrar, {t_addr}.")
 
 
 def _paneles_vivos() -> list[dict]:
@@ -130,7 +354,7 @@ def _clima_loop() -> None:
     cualquier momento y "parcialmente nublado" en modo EN desentona).
     Fail-silent: sin red, se queda con el último."""
     while True:
-        for idi in ("es", "en"):
+        for idi in ("es", "en", "ml"):
             c = _clima(idi)
             if c:
                 S["clima"][idi] = c
@@ -176,7 +400,7 @@ def _panel_vault(nombre: str, input_: dict) -> None:
 #     donde CoreAudio se cuelga; PortAudio limpia al salir). Pero sí se
 #     PAUSA: si nadie necesita el mic por PAUSA_OCIOSO segundos, abort()
 #     suelta el hardware — el indicador naranja de macOS se apaga (reporte
-#     de Charles 2026-07-13: el puntito quedaba fijo tras el primer uso) —
+#     de Ma'am 2026-07-13: el puntito quedaba fijo tras el primer uso) —
 #     y el MISMO stream se reanuda con start() al próximo uso. abort/start
 #     sobre un stream vivo es el patrón normal de cualquier app de voz;
 #     el veneno era el close()+open() de streams nuevos, y encima
@@ -196,10 +420,10 @@ CHUNK = 1280           # 80 ms @ 16 kHz — lo que espera openwakeword
 UMBRAL_WAKE = 0.35     # score para despertar — bajado de 0.5 (2026-07-05) para
                        # que "jarvis" a secas también dispare; si empieza a
                        # despertar por error, subirlo de a 0.05
-SILENCIO_FIN = 1.3     # segundos callado = terminaste de hablar — 1.0 cortaba
-                       # a Charles a media frase en pausas naturales
-MAX_UTTERANCE = 15.0   # tope de captura por turno
-ESPERA_HABLA = 6.0     # despertó pero nunca habló → volver a dormir
+SILENCIO_FIN = 2.5     # segundos callado = terminaste de hablar — 1.0 cortaba
+                       # a Ma'am a media frase en pausas naturales
+MAX_UTTERANCE = 60.0   # tope de captura por turno
+ESPERA_HABLA = 10.0     # despertó pero nunca habló → volver a dormir
 PAUSA_OCIOSO = 20.0    # sin manos libres ni push-to-talk por tanto tiempo →
                        # abort() del stream (indicador naranja fuera). Gracia
                        # holgada: entre clicks de una conversación normal el
@@ -324,11 +548,18 @@ def _audio_daemon() -> None:
             elif time.time() - ocioso_desde >= PAUSA_OCIOSO:
                 try:
                     stream.abort()
-                    pausado = True
-                    _audio["vivo"] = False
-                    S["nivel"] = 0.0
-                except Exception as e:
-                    soltar(e)
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+                stream = None
+                pausado = False
+                _audio["vivo"] = False
+                S["nivel"] = 0.0
+                ocioso_desde = None
                 continue
         else:
             ocioso_desde = None
@@ -435,7 +666,7 @@ def estado():
         # heartbeat anti-eco: mientras la voz de jarvis suena, cada poll
         # renueva la pausa del oído (ver /api/hablando)
         S["hablando_browser"] = time.time()
-    if request.args.get("idioma") in ("es", "en"):
+    if request.args.get("idioma") in IDIOMAS_SOPORTADOS:
         # el poll sincroniza el idioma al server: así el oído transcribe en
         # el idioma correcto aun antes del primer turno tras el toggle
         S["idioma"] = request.args["idioma"]
@@ -451,6 +682,11 @@ def estado():
                     "pendiente": S["pendiente"] is not None, "aviso": aviso,
                     "timers": timers, "clima": S["clima"].get(S["idioma"]),
                     "paneles": _paneles_vivos()})
+
+
+@app.get("/api/ventanas")
+def ventanas():
+    return jsonify(preparar_datos_picker_ventanas())
 
 
 @app.post("/api/manos_libres")
@@ -522,8 +758,12 @@ def mic_stop():
     if not _audio["grabando"]:
         # los errores visibles en la UI se componen en el idioma del toggle
         # (mismo patrón que el aviso de timer y la despedida, sesión 33)
-        return jsonify({"error": "wasn't recording" if S["idioma"] == "en"
-                        else "no estaba grabando"}), 409
+        # NOTE: "ml" text machine-drafted — review with a native speaker
+        error = {
+            "en": "wasn't recording",
+            "ml": "റെക്കോർഡ് ചെയ്യുന്നുണ്ടായിരുന്നില്ല",
+        }.get(S["idioma"], "no estaba grabando")
+        return jsonify({"error": error}), 409
     _audio["grabando"] = False
     # ojo: nivel NO se toca acá — el único escritor es el daemon (si lo
     # pisáramos, su chunk en vuelo lo revive); él lo baja a 0 en ≤80ms
@@ -541,8 +781,12 @@ def mic_stop():
     finally:
         S["fase"] = "listo"
     if not texto:
-        return jsonify({"error": "didn't hear anything" if S["idioma"] == "en"
-                        else "no escuché nada"})
+        # NOTE: "ml" text machine-drafted — review with a native speaker
+        error = {
+            "en": "didn't hear anything",
+            "ml": "ഒന്നും കേട്ടില്ല",
+        }.get(S["idioma"], "no escuché nada")
+        return jsonify({"error": error})
     return jsonify({"texto": texto})
 
 
@@ -557,6 +801,7 @@ def stream():
     d = request.json or {}
     entrada = d.get("texto", "").strip()
     idioma = d.get("idioma", "es")
+    window_id = d.get("window_id")
     S["idioma"] = idioma  # el oído también transcribe en este idioma
     if d.get("briefing"):
         # briefing proactivo del primer boot del día: la recolección de
@@ -572,7 +817,7 @@ def stream():
         # tarjeta de agenda: las secciones del briefing SIN el clima (tiene
         # tarjeta propia) y SIN la prosa que no esté en el idioma de la UI —
         # el vault es español, así que en modo EN capturas/proyectos salían
-        # en español dentro de la tarjeta (el bug que reportó Charles). El
+        # en español dentro de la tarjeta (el bug que reportó Ma'am). El
         # cerebro igual las narra traducidas; a la tarjeta solo va lo que ya
         # está en el idioma correcto (fecha, entregas de Canvas).
         # limpiar_markdown: la prosa del vault trae callouts/negritas/
@@ -594,6 +839,11 @@ def stream():
     if S["ocupado"]:
         return jsonify({"error": _err_ocupado(idioma)}), 409
 
+    # capturado ANTES del anexo de instrucción de idioma (abajo): ese anexo
+    # se pega a `entrada` para todo turno, así que es_pedido_salida() (match
+    # exacto) tiene que mirar el texto tal cual lo tipeó/dijo el usuario.
+    entrada_original = entrada
+
     # el toggle de idioma de la UI manda sobre el cerebro: en cada modo
     # responde SIEMPRE en ese idioma, le hablen como le hablen (los
     # subtítulos son su respuesta — sin esto el demo quedaba mixto).
@@ -601,15 +851,22 @@ def stream():
     # `claude -p --resume` ignora --append-system-prompt al retomar una
     # sesión, así que por el system solo entraba en el turno 1.
     sistema = S["system"]
+    t_addr = S.get("tratamiento", "Ma'am")
     if idioma == "en":
         entrada += ("\n\n[UI language mode: ENGLISH — reply ONLY in English "
                     "this turn, no matter the language spoken to you. Same "
-                    "persona, same dry wit. Say \"sir\" at most ONCE in this "
+                    f"persona, same dry wit. Say \"{t_addr}\" at most ONCE in this "
                     "reply, never twice. Don't mention this note.]")
+    elif idioma == "ml":
+        entrada += ("\n\n[UI language mode: MALAYALAM — reply ONLY in "
+                    "Malayalam this turn, no matter the language spoken to "
+                    f"you. Same persona, same dry wit. Say \"{t_addr}\" at most "
+                    "ONCE in this reply, never twice. Don't mention this "
+                    "note.]")
     else:
         entrada += ("\n\n[Modo de idioma de la UI: ESPAÑOL — respondé SOLO "
                     "en español este turno, te hablen en el idioma que te "
-                    "hablen. Misma persona. Decí «señor» como máximo UNA vez "
+                    f"hablen. Misma persona. Decí «{t_addr}» como máximo UNA vez "
                     "en esta respuesta, nunca dos. No menciones esta nota.]")
 
     def gen():
@@ -617,8 +874,235 @@ def stream():
         S["fase"] = "pensando"
         pendiente = ""   # texto acumulado aún sin cortar en oraciones
         primera = True   # el primer bocado se corta temprano (ver abajo)
+        vision_image = None
         try:
-            for ev in preguntar_stream(entrada, sistema, S["session_id"]):
+            # ── Natural-language exit ────────────────────────────────────
+            # Checked FIRST, before the WTC Calendar confirmation bridge,
+            # WTC updates/source-scan routes, Vision, and preguntar_stream:
+            # an exit phrase always ends the turn here, never falls through
+            # to any of those (so a pending Calendar proposal can't
+            # accidentally swallow it, and it can't reach a tool call).
+            # Reuses the same session-memory-save + despedida semantics as
+            # the existing /api/salir endpoint (not calling it over HTTP).
+            if es_pedido_salida(entrada_original):
+                if S["session_id"]:
+                    escribir_memoria(S["system"], S["session_id"])
+                    S["session_id"] = None
+                    respuesta = _texto_despedida(
+                        S["idioma"], S.get("tratamiento", "Ma'am"))
+                else:
+                    respuesta = _texto_sin_sesion(
+                        S["idioma"], S.get("tratamiento", "Ma'am"))
+                yield _sse({"tipo": "oracion", "texto": respuesta})
+                yield _sse({"tipo": "fin", "texto": respuesta})
+                return
+
+            # ── HUD Calendar confirmation bridge ────────────────────────
+            # Completes the existing Calendar approval flow for a WTC
+            # source-scan proposal without ever granting a Calendar write
+            # tool to a normal conversation turn. Reuses the SAME
+            # unmodified primitives the standalone terminal REPL already
+            # uses (detectar_confirmacion / validar_accion_pendiente /
+            # ejecutar_calendar_create_event) — see jarvis_cli.py:
+            # construir_propuesta_calendar_wtc(). Checked first, before
+            # any WTC intent detection, since a bare "yes"/"no" wouldn't
+            # match those anyway and this is the more specific, stateful
+            # case. If nothing is pending, this is a no-op.
+            if S.get("wtc_pending_calendar") is not None:
+                if detectar_confirmacion(entrada):
+                    plan_pendiente = S["wtc_pending_calendar"]
+                    S["wtc_pending_calendar"] = None
+                    resumen = plan_pendiente.get("parameters", {}).get(
+                        "summary", "the event")
+                    if validar_accion_pendiente(plan_pendiente):
+                        try:
+                            resultado, _ = ejecutar_calendar_create_event(
+                                plan_pendiente, S["system"], None, execute=True)
+                        except Exception as e:
+                            resultado = {"status": "failed", "reason": str(e)}
+                        estado = resultado.get("status")
+                        if estado == "executed":
+                            respuesta = f'Done — created "{resumen}" on your calendar.'
+                        elif estado == "blocked":
+                            respuesta = (f'I couldn\'t create "{resumen}" — '
+                                         f'{resultado.get("reason", "blocked by a safety check")}.')
+                        else:
+                            respuesta = (f'That calendar write didn\'t go through — '
+                                         f'{resultado.get("reason", "unknown error")}.')
+                    else:
+                        respuesta = "That proposal is no longer valid — run the WTC check again."
+                    yield _sse({"tipo": "oracion", "texto": respuesta})
+                    yield _sse({"tipo": "fin", "texto": respuesta})
+                    return
+
+                # Same cancel detection route_command() already uses in
+                # the terminal REPL (jarvis_cli.py).
+                if detectar_cancelacion(entrada):
+                    S["wtc_pending_calendar"] = None
+                    respuesta = "Okay, I won't create that calendar event."
+                    yield _sse({"tipo": "oracion", "texto": respuesta})
+                    yield _sse({"tipo": "fin", "texto": respuesta})
+                    return
+                # Neither confirm nor cancel: fall through to normal
+                # conversation: the proposal stays pending for a later turn.
+
+            # ── Generic Calendar CREATE confirmation bridge ─────────────
+            # Additive, parallel to the WTC bridge above — services a
+            # pending Calendar create_event proposal built from an
+            # ordinary conversational request (see the detection block
+            # further below), using the SAME unmodified primitives
+            # (detectar_confirmacion / validar_accion_pendiente /
+            # ejecutar_calendar_create_event / detectar_cancelacion).
+            # Never a second execution path, never a new writer — only a
+            # second producer for S["calendar_pending_action"].
+            if S.get("calendar_pending_action") is not None:
+                # NOTE: must check entrada_original, not entrada — by this
+                # point entrada has the UI-language-mode note appended
+                # (see above), so detectar_confirmacion()'s full-string
+                # match against entrada would never equal a bare "yes"
+                # and this bridge would always fall through to
+                # preguntar_stream(). entrada_original is the raw user
+                # text captured before that note is appended.
+                if detectar_confirmacion(entrada_original):
+                    plan_pendiente = S["calendar_pending_action"]
+                    S["calendar_pending_action"] = None
+                    resumen = plan_pendiente.get("parameters", {}).get(
+                        "summary", "the event")
+                    if validar_accion_pendiente(plan_pendiente):
+                        try:
+                            resultado, _ = ejecutar_calendar_create_event(
+                                plan_pendiente, S["system"], None, execute=True)
+                        except Exception as e:
+                            resultado = {"status": "failed", "reason": str(e)}
+                        estado = resultado.get("status")
+                        if estado == "executed":
+                            event_id = resultado.get("event_id")
+                            respuesta = (
+                                f'Done — created "{resumen}" on your calendar'
+                                + (f" (event ID {event_id})." if event_id else ".")
+                            )
+                        elif estado == "blocked":
+                            respuesta = (f'I couldn\'t create "{resumen}" — '
+                                         f'{resultado.get("reason", "blocked by a safety check")}.')
+                        else:
+                            respuesta = (f'That calendar write didn\'t go through — '
+                                         f'{resultado.get("reason", "unknown error")}.')
+                    else:
+                        respuesta = "That proposal is no longer valid — please ask again."
+                    yield _sse({"tipo": "oracion", "texto": respuesta})
+                    yield _sse({"tipo": "fin", "texto": respuesta})
+                    return
+
+                # Same cancel detection the WTC bridge above already uses.
+                # Same entrada_original note as detectar_confirmacion() above.
+                if detectar_cancelacion(entrada_original):
+                    S["calendar_pending_action"] = None
+                    respuesta = "Okay, I won't create that calendar event."
+                    yield _sse({"tipo": "oracion", "texto": respuesta})
+                    yield _sse({"tipo": "fin", "texto": respuesta})
+                    return
+                # Neither confirm nor cancel: fall through to normal
+                # conversation: the proposal stays pending for a later turn.
+
+            # ── Generic Calendar CREATE detection (additive) ────────────
+            # Services an ordinary conversational "create a calendar
+            # event…" request the same way the standalone terminal REPL
+            # already does (jarvis_cli.py main(), the pending_action
+            # block) — same unmodified planner/validator functions, same
+            # pending-action shape, same explicit-confirmation gate.
+            # MANOS_TOOLS stays read-only for Calendar: this never calls
+            # create_event directly, it only ever populates
+            # S["calendar_pending_action"], which the confirmation bridge
+            # above requires an explicit "yes" to act on next turn. An
+            # incomplete/unresolvable request leaves no pending action and
+            # falls through to normal conversation, which can ask for the
+            # missing details.
+            if (
+                S.get("wtc_pending_calendar") is None
+                and S.get("calendar_pending_action") is None
+                and detectar_intencion(entrada_original) == "calendar"
+            ):
+                plan_calendar = planificar_accion_seca(entrada_original, "calendar")
+                plan_calendar = clasificar_modo_accion(plan_calendar)
+                plan_calendar = extraer_parametros_accion(entrada_original, plan_calendar)
+
+                if (
+                    plan_calendar.get("action") == "create_event"
+                    and plan_calendar.get("mode") == "write"
+                    and plan_calendar.get("approval") == "required"
+                ):
+                    resolucion_calendar = resolver_tiempos_calendar(plan_calendar)
+                    if resolucion_calendar.get("valid"):
+                        plan_calendar["parameters"] = dict(
+                            resolucion_calendar.get("parameters") or {})
+                        plan_calendar["parameters"].setdefault("calendarId", "primary")
+
+                        validacion_calendar = validar_calendar_write(plan_calendar)
+                        if validacion_calendar.get("valid"):
+                            pendiente_calendar = establecer_accion_pendiente(plan_calendar)
+                            if validar_accion_pendiente(pendiente_calendar):
+                                S["calendar_pending_action"] = pendiente_calendar
+                                respuesta = crear_solicitud_aprobacion(pendiente_calendar)
+                                yield _sse({"tipo": "oracion", "texto": respuesta})
+                                yield _sse({"tipo": "fin", "texto": respuesta})
+                                return
+                    # Incomplete or unresolved (missing date/time, missing
+                    # duration/end time, etc.): no pending write is
+                    # created here — falls through to normal conversation
+                    # below so the model can ask for what's missing.
+
+            if es_pedido_wtc_updates(entrada):
+                # Dedicated, narrow, READ-ONLY "check WTC updates" path.
+                # Deliberately bypasses preguntar_stream (general
+                # MANOS_TOOLS, write-capable tools) and the resumable
+                # session entirely — see jarvis_cli.py:
+                # WTC_UPDATES_READONLY_TOOLS / obtener_wtc_updates().
+                # S["session_id"] is left untouched.
+                respuesta = obtener_wtc_updates()
+                yield _sse({"tipo": "oracion", "texto": respuesta})
+                yield _sse({"tipo": "fin", "texto": respuesta})
+                return
+
+            if es_pedido_wtc_source_scan(entrada):
+                # Dedicated, narrow, READ-ONLY WTC *source-document* scan
+                # path — see jarvis_cli.py: WTC_SOURCE_SCAN_READONLY_TOOLS
+                # / obtener_wtc_source_scan() / wtc_source_bridge.py. Same
+                # isolation discipline as the WTC updates path above:
+                # bypasses preguntar_stream (general MANOS_TOOLS) and the
+                # resumable session entirely. S["session_id"] untouched.
+                respuesta = obtener_wtc_source_scan()
+                # The scan (above) already refreshed data/wtc/wtc_state.json
+                # as a side effect — read it back (read-only) to see if it
+                # contains a Calendar-eligible candidate. Building the
+                # pending plan here does not execute anything: it only
+                # ever sets S["wtc_pending_calendar"], which the
+                # confirmation bridge above requires an explicit "yes" to
+                # act on next turn.
+                S["wtc_pending_calendar"] = construir_propuesta_calendar_wtc(
+                    cargar_wtc_state())
+                yield _sse({"tipo": "oracion", "texto": respuesta})
+                yield _sse({"tipo": "fin", "texto": respuesta})
+                return
+
+            if window_id is not None:
+                try:
+                    selected_window_id = int(window_id)
+                except (TypeError, ValueError):
+                    raise ValueError("invalid window_id")
+
+                selected_window = seleccionar_ventana(selected_window_id)
+                if selected_window is None:
+                    raise ValueError("selected window is no longer visible")
+
+                yield _sse({"tipo": "captura", "texto": "capturando"})
+                vision_image = capturar_ventana_seleccionada(selected_window)
+
+            for ev in preguntar_stream(
+                entrada,
+                sistema,
+                S["session_id"],
+                image_path=vision_image,
+            ):
                 if ev[0] == "delta":
                     pendiente += ev[1]
                     yield _sse({"tipo": "delta", "texto": ev[1]})
@@ -640,7 +1124,7 @@ def stream():
                     # corte de oraciones espera texto posterior que no llega
                     # — lo siguiente es el tool_use — y el "on it" sonaba
                     # con la acción ya hecha, pegado al "listo" (reporte de
-                    # Charles 2026-07-12). Al arrancar una mano se suelta lo
+                    # Ma'am 2026-07-12). Al arrancar una mano se suelta lo
                     # acumulado: se dice MIENTRAS la herramienta corre.
                     if pendiente.strip():
                         yield _sse({"tipo": "oracion", "texto": pendiente})
@@ -660,6 +1144,11 @@ def stream():
         except Exception as e:
             yield _sse({"tipo": "error", "texto": str(e)})
         finally:
+            if vision_image is not None:
+                try:
+                    vision_image.unlink(missing_ok=True)
+                except OSError:
+                    pass
             S["fase"] = "listo"
             S["ocupado"] = False
 
@@ -671,15 +1160,20 @@ def stream():
 @app.post("/api/tts")
 def tts():
     """Sintetiza una oración con edge-tts y devuelve el mp3 al browser."""
-    texto = _limpiar_para_voz((request.json or {}).get("texto", ""))
+    d = request.json or {}
+    texto = _limpiar_para_voz(d.get("texto", ""))
     if not texto:
         return ("", 204)
+    # la voz sigue al idioma de la UI (o al que mande el request puntual);
+    # antes de "ml" todas las voces eran la misma multilingüe, así que esto
+    # no cambia nada para es/en — ver voz_para() en jarvis_voz.py
+    voz = voz_para(d.get("idioma") or S["idioma"])
     try:
         import edge_tts
 
         async def _gen() -> bytes:
             buf = bytearray()
-            com = edge_tts.Communicate(texto, VOZ, rate=VOZ_RATE)
+            com = edge_tts.Communicate(texto, voz, rate=VOZ_RATE)
             async for chunk in com.stream():
                 if chunk["type"] == "audio":
                     buf.extend(chunk["data"])
@@ -708,13 +1202,18 @@ def timer():
 
     def avisar():
         # el texto se compone AL VENCER, en el idioma que la UI tenga en ese
-        # momento — un timer puesto en español puede vencer en modo inglés
+        # momento — un timer puesto en un idioma puede vencer en otro
+        t_addr = tratamiento_para(S["idioma"], S.get("tratamiento", "Ma'am"))
         if S["idioma"] == "en":
-            texto = (f"Your {etiqueta} timer is done, sir." if etiqueta
-                     else f"Your {minutos:g} minute timer is done, sir.")
+            texto = (f"Your {etiqueta} timer is done, {t_addr}." if etiqueta
+                     else f"Your {minutos:g} minute timer is done, {t_addr}.")
+        elif S["idioma"] == "ml":
+            # NOTE: machine-drafted — review with a native speaker
+            texto = (f"നിങ്ങളുടെ {etiqueta} ടൈമർ കഴിഞ്ഞു, {t_addr}." if etiqueta
+                     else f"നിങ്ങളുടെ {minutos:g} മിനിറ്റ് ടൈമർ കഴിഞ്ഞു, {t_addr}.")
         else:
-            texto = (f"Terminó el timer de {etiqueta}, señor." if etiqueta
-                     else f"Terminó tu timer de {minutos:g} minutos, señor.")
+            texto = (f"Terminó el timer de {etiqueta}, {t_addr}." if etiqueta
+                     else f"Terminó tu timer de {minutos:g} minutos, {t_addr}.")
         with S["lock"]:
             S["avisos"].append(texto)
             if registro in S["timers"]:
@@ -737,9 +1236,7 @@ def salir():
     try:
         nota = escribir_memoria(S["system"], S["session_id"])
         S["session_id"] = None
-        despedida = ("Session memory saved to the vault, sir."
-                     if S["idioma"] == "en" else
-                     "Memoria de sesión guardada en el vault, señor.")
+        despedida = _texto_despedida(S["idioma"], S.get("tratamiento", "Ma'am"))
         return jsonify({"nota": str(nota.relative_to(VAULT)),
                         "despedida": despedida})
     except Exception as e:
@@ -749,11 +1246,55 @@ def salir():
         S["ocupado"] = False
 
 
+@app.get("/api/profile")
+def profile_get():
+    """Perfil del usuario actual — el HUD lo consulta al bootear para decidir
+    si mostrar el onboarding (perfil ausente) o entrar directo."""
+    perfil = cargar_perfil()
+    if perfil is None:
+        return jsonify({"onboarded": False})
+    return jsonify({"onboarded": True, "nombre": perfil.get("nombre"),
+                    "idioma": perfil.get("idioma"),
+                    "voz": perfil.get("voz", "auto"),
+                    "tratamiento": perfil.get("tratamiento", "Ma'am")})
+
+
+@app.post("/api/profile")
+def profile_post():
+    """Guarda el perfil (onboarding o Settings). El onboarding solo ofrece
+    inglés y malayalam — español sigue existiendo como default legacy para
+    quien ya lo venía usando, pero no se ofrece como opción nueva acá."""
+    d = request.json or {}
+    nombre = str(d.get("nombre") or "").strip()
+    idioma = str(d.get("idioma") or "").strip()
+    voz = str(d.get("voz") or "auto").strip() or "auto"
+    tratamiento = str(d.get("tratamiento") or "Ma'am").strip()
+    if not nombre:
+        return jsonify({"error": "name required" if idioma == "en"
+                        else "falta el nombre"}), 400
+    if idioma not in IDIOMAS_ONBOARDING:
+        return jsonify({"error": f"idioma debe ser uno de {IDIOMAS_ONBOARDING}"}), 400
+    if tratamiento not in TRATAMIENTOS:
+        return jsonify({"error": f"tratamiento debe ser uno de {TRATAMIENTOS}"}), 400
+    guardar_perfil(nombre, idioma, voz, tratamiento)
+    S["idioma"] = idioma
+    S["tratamiento"] = tratamiento
+    S["system"] = cargar_contexto(S.get("ruta")) + persona(nombre, tratamiento)
+    return jsonify({"ok": True, "nombre": nombre, "idioma": idioma, "voz": voz,
+                    "tratamiento": tratamiento})
+
+
 # ── Arranque ──────────────────────────────────────────────────────────────
 
 def main() -> None:
     ruta = sys.argv[1].strip("/") if len(sys.argv) > 1 else None
-    S["system"] = cargar_contexto(ruta) + PERSONA
+    S["ruta"] = ruta  # para reconstruir el system prompt si /api/profile cambia el nombre
+    # perfil por-usuario: sin perfil guardado todavía se mantiene el
+    # comportamiento de siempre (idioma "es", nombre "Ma'am" por defecto) —
+    # el HUD decide si mostrar el onboarding vía /api/profile (ver ui.html)
+    S["idioma"] = idioma_actual(default="es")
+    S["tratamiento"] = tratamiento_actual()
+    S["system"] = cargar_contexto(ruta) + persona(nombre_actual(), S["tratamiento"])
 
     # Precalentar el STT: con yap pre-verifica binario y asset; sin yap
     # carga el modelo de Whisper para que el primer turno no pague eso
