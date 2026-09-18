@@ -118,7 +118,10 @@ CALENDAR_DELETE_TOOLS = [
 ]
 
 # Dedicated Gmail WRITE boundary.
-# Normal conversational turns MUST NOT receive send/reply/forward tools.
+# Normal conversational turns MUST NOT receive create_draft (routed
+# through ejecutar_gmail_create_draft()'s own approval gate instead —
+# see the pending-action confirmation dispatch in main()) or any send/
+# reply/forward tool.
 GMAIL_CREATE_DRAFT_TOOLS = [
     "mcp__claude_ai_Gmail__create_draft",
 ]
@@ -133,7 +136,6 @@ MANOS_TOOLS = [
      "ToolSearch",
 
 "mcp__claude_ai_Gmail__search_threads",
-"mcp__claude_ai_Gmail__create_draft",
 "mcp__claude_ai_Google_Drive__search_files",
 "mcp__claude_ai_Google_Drive__read_file_content",
 "mcp__claude_ai_Google_Drive__get_file_permissions",
@@ -217,8 +219,12 @@ Tenés manos, pero limitadas. Podés usar EXACTAMENTE esto y nada más:
 
    Gmail:
    - buscar threads: mcp__claude_ai_Gmail__search_threads
-   - crear borradores: mcp__claude_ai_Gmail__create_draft
-   - podés preparar borradores, pero NO enviar, responder ni reenviar correos
+   - NO tenés la mano de crear_draft en esta conversación. Si {NOMBRE}
+     pide preparar/redactar un borrador de correo, no la busques con
+     ToolSearch ni la inventes: eso pasa por el mismo sistema de
+     aprobación que create_event (plan → confirmación explícita →
+     ejecución aislada). Armá el plan y esperá esa confirmación.
+   - Nunca enviás, respondés ni reenviás correos: esa mano no existe.
 
 Google Calendar:
 
@@ -2163,6 +2169,565 @@ def revalidar_gmail_create_draft_aprobado(pending: dict) -> dict:
         "reason": "approved_gmail_create_draft_revalidated",
         "parameters": payload,
     }
+
+
+def ejecutar_gmail_create_draft_claude(
+    parametros: dict,
+    system: str,
+) -> tuple[str, str | None]:
+    """Run one isolated Gmail create_draft Claude turn.
+
+    Mirrors ejecutar_calendar_create_event_claude(): a minimal,
+    persona-free single-purpose worker that receives only ToolSearch +
+    the dedicated Gmail create_draft tool, and makes no approval
+    decision of its own.
+    """
+    prompt = (
+        "EXECUTE ONE APPROVED GMAIL DRAFT CREATION.\n\n"
+        f"You have explicit approval from {NOMBRE} for exactly this operation.\n"
+        "First, use ToolSearch with query "
+        "'select:mcp__claude_ai_Gmail__create_draft' to load the Gmail "
+        "create_draft tool.\n"
+        "Use ONLY the Gmail create_draft tool.\n"
+        "Do not send, reply to, forward, or modify any message or draft "
+        "other than creating this one.\n"
+        "Do not change, reinterpret, or invent any parameter.\n"
+        "Do not perform any other action.\n\n"
+        "APPROVED PARAMETERS (JSON):\n"
+        f"{json.dumps(parametros, ensure_ascii=False)}\n\n"
+        "Call mcp__claude_ai_Gmail__create_draft exactly once with those "
+        "parameters. After the tool call, end your response with a "
+        "final line using EXACTLY this format (uppercase DRAFT_ID, one "
+        "space after the colon, no Markdown, no backticks, nothing else "
+        "on that line):\n"
+        "DRAFT_ID: <draft_id>\n"
+        "That line must be the very last line of your response. Use "
+        "the real draft ID returned by the tool call — never invent or "
+        "guess one. If the tool call did not return a draft ID, do not "
+        "output a DRAFT_ID line at all; instead state explicitly that "
+        "no draft ID was returned."
+    )
+
+    # Same fix as the Calendar create/delete executors (commits c51171f,
+    # dcdb437, 70278a1, 7f90255): a minimal, self-contained prompt with no
+    # inherited persona/approval rule to conflict with, bypassPermissions
+    # instead of "auto" (which would route the tool call through an
+    # unanswerable interactive permission check in this headless
+    # subprocess), and ToolSearch loaded explicitly for this deferred tool.
+    system_ejecutor = (
+        "You are a single-purpose Gmail-draft creation worker. You are "
+        "not a conversational assistant and have no persona.\n\n"
+        "The OUTER JARVIS process has already completed its own approval "
+        "gate for this exact operation and confirmed it with the user "
+        "before starting you. You have no approval decision to make: do "
+        "not ask for, and do not independently verify, any conversational "
+        "approval — that step already happened outside this process, "
+        "before you existed.\n\n"
+        "APPROVED PARAMETERS (JSON, authoritative — do not modify):\n"
+        f"{json.dumps(parametros, ensure_ascii=False)}\n\n"
+        "Your task, in order:\n"
+        "1. Use ToolSearch with query "
+        "'select:mcp__claude_ai_Gmail__create_draft' to load the Gmail "
+        "create_draft tool.\n"
+        "2. Call mcp__claude_ai_Gmail__create_draft exactly once, using "
+        "the APPROVED PARAMETERS above exactly as given.\n"
+        "3. Do not perform any other tool call or action of any kind.\n\n"
+        "End your response with a final line using EXACTLY this format "
+        "(uppercase DRAFT_ID, one space after the colon, no Markdown, no "
+        "backticks, nothing else on that line):\n"
+        "DRAFT_ID: <draft_id>\n"
+        "That line must be the very last line of your response. Use the "
+        "real draft ID returned by the tool call — never invent or guess "
+        "one. If the tool call did not return a draft ID, do not output "
+        "a DRAFT_ID line at all; instead state explicitly that no draft "
+        "ID was returned."
+    )
+
+    cmd = [
+        "claude", "-p", prompt,
+        "--output-format", "json",
+        "--model", MODEL,
+        "--permission-mode", "bypassPermissions",
+        "--permission-prompts", "none",
+        "--system-prompt", system_ejecutor,
+        "--allowedTools", "ToolSearch", *GMAIL_CREATE_DRAFT_TOOLS,
+        "--tools", "ToolSearch", *GMAIL_CREATE_DRAFT_TOOLS,
+        "--add-dir", str(VAULT),
+    ]
+
+    r = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        cwd=VAULT / "01-Projects/Jarvis/code",
+    )
+
+    if r.returncode != 0:
+        try:
+            data = _json_de_stdout(r.stdout)
+        except json.JSONDecodeError:
+            data = None
+        raise RuntimeError(
+            "isolated Gmail create_draft failed: "
+            f"returncode={r.returncode} stderr={r.stderr.strip()} "
+            f"json_result={json.dumps(data, ensure_ascii=False) if data else None}"
+        )
+
+    data = _json_de_stdout(r.stdout)
+
+    if data.get("is_error"):
+        raise RuntimeError(
+            "isolated Gmail create_draft returned is_error=true: "
+            + json.dumps(data, ensure_ascii=False)
+        )
+
+    resultado = data.get("result", "")
+
+    if not str(resultado).strip():
+        raise RuntimeError(
+            "isolated Gmail create_draft returned no usable result "
+            "(no draft ID recoverable): " + json.dumps(data, ensure_ascii=False)
+        )
+
+    return resultado, data.get("session_id")
+
+
+def verificar_gmail_draft_claude(draft_id: str, parametros: dict, system: str) -> dict:
+    """Read back one Gmail draft by exact ID to independently verify creation.
+
+    Strictly read-only. The isolated Claude turn receives only ToolSearch
+    plus the existing, already-authenticated Gmail get_draft tool — no
+    write, send, reply, or forward tool of any kind. Mirrors
+    verificar_calendar_evento_claude()'s minimal, persona-free pattern.
+    """
+    if not draft_id:
+        return {
+            "status": "verification_failed",
+            "reason": "missing_gmail_draft_id",
+        }
+
+    prompt = (
+        "VERIFY ONE GMAIL DRAFT — READ ONLY.\n\n"
+        "First, use ToolSearch with query "
+        "'select:mcp__claude_ai_Gmail__get_draft' to load the Gmail "
+        "get_draft tool.\n"
+        f"Retrieve ONLY draft ID: {draft_id}\n"
+        "Do not create, send, reply, forward, update, delete, or modify "
+        "any draft or message.\n"
+        "Use ONLY the Gmail get_draft tool.\n\n"
+        "After the tool call, respond with ONLY the native draft object "
+        "as valid JSON — no prose, no Markdown, no commentary, nothing "
+        "else in the response."
+    )
+
+    system_ejecutor = (
+        "You are a single-purpose, read-only Gmail-verification worker. "
+        "You are not a conversational assistant and have no persona.\n\n"
+        "The OUTER JARVIS process is using you to independently confirm "
+        "one exact Gmail draft after a create_draft write it already "
+        "approved and executed outside this process. You make no "
+        "approval decision, and you perform no write of any kind.\n\n"
+        "TARGET (JSON, authoritative — do not modify):\n"
+        f"{json.dumps({'draftId': draft_id}, ensure_ascii=False)}\n\n"
+        "Your task, in order:\n"
+        "1. Use ToolSearch with query "
+        "'select:mcp__claude_ai_Gmail__get_draft' to load the Gmail "
+        "get_draft tool.\n"
+        "2. Call mcp__claude_ai_Gmail__get_draft exactly once for the "
+        "TARGET draft ID above.\n"
+        "3. Do not perform any other tool call or action of any kind.\n\n"
+        "Respond with ONLY the native draft object returned by "
+        "get_draft, as valid JSON — no prose, no Markdown, no "
+        "commentary, nothing else in the response. If get_draft fails "
+        "or the draft cannot be found, respond with ONLY this exact "
+        "JSON object instead:\n"
+        '{"error": "not_found"}'
+    )
+
+    cmd = [
+        "claude", "-p", prompt,
+        "--output-format", "json",
+        "--model", MODEL,
+        "--permission-mode", "bypassPermissions",
+        "--permission-prompts", "none",
+        "--system-prompt", system_ejecutor,
+        "--allowedTools", "ToolSearch", "mcp__claude_ai_Gmail__get_draft",
+        "--tools", "ToolSearch", "mcp__claude_ai_Gmail__get_draft",
+        "--add-dir", str(VAULT),
+    ]
+
+    r = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        cwd=VAULT / "01-Projects/Jarvis/code",
+    )
+
+    if r.returncode != 0:
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_get_draft_execution_failed",
+            "error": (
+                r.stderr.strip()
+                or r.stdout.strip()
+                or "isolated Gmail get_draft failed"
+            ),
+        }
+
+    try:
+        data = _json_de_stdout(r.stdout)
+    except json.JSONDecodeError as e:
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_get_draft_invalid_response",
+            "error": str(e),
+        }
+
+    if data.get("is_error"):
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_get_draft_returned_error",
+            "error": data.get("result", "Gmail get_draft returned an error"),
+        }
+
+    raw_result = data.get("result", "")
+
+    try:
+        if isinstance(raw_result, dict):
+            draft = raw_result
+        else:
+            cleaned = str(raw_result).strip()
+            if cleaned.startswith("```"):
+                lines = cleaned.splitlines()
+                if lines and lines[0].startswith("```"):
+                    lines = lines[1:]
+
+                closing_fence = None
+                for index, line in enumerate(lines):
+                    if line.strip() == "```":
+                        closing_fence = index
+                        break
+
+                if closing_fence is not None:
+                    lines = lines[:closing_fence]
+
+                cleaned = "\n".join(lines).strip()
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:].lstrip()
+
+            draft = json.loads(cleaned)
+    except (TypeError, json.JSONDecodeError) as e:
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_get_draft_unparseable_response",
+            "error": str(e),
+            "raw_response": raw_result,
+        }
+
+    if not isinstance(draft, dict):
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_get_draft_invalid_draft_object",
+        }
+
+    if draft.get("id") != draft_id:
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_draft_id_mismatch",
+            "draft_id": draft.get("id"),
+        }
+
+    # Field-level verification against the REAL get_draft response shape
+    # (captured live, 2026-09-18): toRecipients/subject/plaintextBody are
+    # flat top-level fields, exactly like Calendar's summary/start.dateTime/
+    # end.dateTime — not nested MIME headers. plaintextBody is authoritative
+    # for the body; htmlBody/snippet are deliberately never compared.
+    def _normalizar_destinatarios(valor):
+        """Only normalizes a single string vs. a list of strings — never
+        changes, drops, or reorders an actual email address."""
+        if isinstance(valor, str):
+            return [valor]
+        if isinstance(valor, list) and all(isinstance(v, str) for v in valor):
+            return valor
+        return None
+
+    if "toRecipients" not in draft:
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_draft_missing_to_recipients_field",
+            "draft_id": draft_id,
+        }
+
+    destinatarios_esperados = _normalizar_destinatarios(parametros.get("to"))
+    destinatarios_reales = _normalizar_destinatarios(draft.get("toRecipients"))
+
+    if (
+        destinatarios_esperados is None
+        or destinatarios_reales is None
+        or destinatarios_reales != destinatarios_esperados
+    ):
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_draft_recipient_mismatch",
+            "draft_id": draft_id,
+            "expected": destinatarios_esperados,
+            "actual": destinatarios_reales,
+        }
+
+    if "subject" not in draft:
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_draft_missing_subject_field",
+            "draft_id": draft_id,
+        }
+
+    if draft.get("subject") != parametros.get("subject"):
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_draft_subject_mismatch",
+            "draft_id": draft_id,
+            "expected": parametros.get("subject"),
+            "actual": draft.get("subject"),
+        }
+
+    if "plaintextBody" not in draft:
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_draft_missing_body_field",
+            "draft_id": draft_id,
+        }
+
+    if draft.get("plaintextBody") != parametros.get("body"):
+        return {
+            "status": "verification_failed",
+            "reason": "gmail_draft_body_mismatch",
+            "draft_id": draft_id,
+            "expected": parametros.get("body"),
+            "actual": draft.get("plaintextBody"),
+        }
+
+    return {
+        "status": "verified",
+        "reason": "gmail_draft_readback_verified",
+        "draft_id": draft_id,
+        "draft": draft,
+    }
+
+
+def preparar_detalles_auditoria_gmail(
+    parametros: dict | None = None,
+    *,
+    draft_id: str | None = None,
+    status: str | None = None,
+) -> dict:
+    """Return only allowlisted, non-secret Gmail audit fields.
+
+    Deliberately excludes the email body — only the recipient and
+    subject (comparable sensitivity to a Calendar event's summary) are
+    persisted to the vault audit trail.
+    """
+    parametros = parametros or {}
+
+    detalles = {}
+
+    to = parametros.get("to")
+    if isinstance(to, list):
+        detalles["to"] = [correo for correo in to if isinstance(correo, str)]
+    elif isinstance(to, str):
+        detalles["to"] = to
+
+    subject = parametros.get("subject")
+    if isinstance(subject, str):
+        detalles["subject"] = subject
+
+    if draft_id is not None:
+        detalles["draftId"] = draft_id
+
+    if status is not None:
+        detalles["status"] = status
+
+    return detalles
+
+
+def registrar_auditoria_gmail(
+    resultado: str,
+    parametros: dict | None = None,
+    *,
+    draft_id: str | None = None,
+    status: str | None = None,
+) -> str | None:
+    """Persist one safe Gmail create_draft action audit entry."""
+
+    detalles = preparar_detalles_auditoria_gmail(
+        parametros,
+        draft_id=draft_id,
+        status=status,
+    )
+
+    try:
+        return registrar_accion_memoria(
+            "Gmail create_draft",
+            resultado,
+            detalles=json.dumps(
+                detalles,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+    except Exception:
+        return None
+
+
+def registrar_auditoria_gmail_fallo(
+    razon: str,
+    parametros: dict | None = None,
+) -> str | None:
+    """Persist one safe Gmail create_draft blocked/failed audit entry."""
+
+    detalles = preparar_detalles_auditoria_gmail(parametros)
+    detalles["reason"] = razon
+
+    try:
+        return registrar_accion_memoria(
+            "Gmail create_draft",
+            "Gmail draft creation was blocked or failed.",
+            detalles=json.dumps(
+                detalles,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+    except Exception:
+        return None
+
+
+def ejecutar_gmail_create_draft(
+    pending: dict,
+    system: str,
+    session_id: str | None,
+    execute: bool = False,
+) -> tuple[dict, str | None]:
+    """Execute one approved Gmail create_draft request safely.
+
+    Mirrors ejecutar_calendar_create_event(): revalidate the exact
+    approved plan, never execute during dry-run, run the isolated
+    writer only when explicitly told to, extract the structured
+    DRAFT_ID contract, then independently verify via a read-only
+    get_draft call before ever reporting success.
+    """
+    revalidacion = revalidar_gmail_create_draft_aprobado(pending)
+
+    if not revalidacion.get("valid"):
+        registrar_auditoria_gmail_fallo(
+            revalidacion.get("reason", "gmail_create_draft_revalidation_failed"),
+            (pending or {}).get("parameters") or {},
+        )
+        return {
+            "status": "blocked",
+            "reason": revalidacion.get(
+                "reason",
+                "gmail_create_draft_revalidation_failed",
+            ),
+            "parameters": (pending or {}).get("parameters") or {},
+        }, session_id
+
+    parametros = revalidacion.get("parameters") or {}
+
+    if not execute:
+        return {
+            "status": "ready",
+            "reason": "gmail_create_draft_ready_for_execution",
+            "parameters": parametros,
+        }, session_id
+
+    try:
+        respuesta, _writer_session_id = ejecutar_gmail_create_draft_claude(
+            parametros,
+            system,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        registrar_auditoria_gmail_fallo(
+            "gmail_create_draft_execution_failed",
+            parametros,
+        )
+        return {
+            "status": "failed",
+            "reason": "gmail_create_draft_execution_failed",
+            "error": str(e),
+            "parameters": parametros,
+        }, session_id
+
+    # Extract the draft ID returned by the isolated writer. The writer's
+    # prompt mandates a final "DRAFT_ID: <id>" line as the primary,
+    # machine-parsable contract (see ejecutar_gmail_create_draft_claude).
+    draft_id = None
+
+    match = re.search(
+        r"^DRAFT_ID:\s*([A-Za-z0-9_-]+)\s*$",
+        respuesta or "",
+        flags=re.MULTILINE,
+    )
+    if match:
+        draft_id = match.group(1)
+
+    # Defensive fallback if the writer returns JSON.
+    if not draft_id:
+        try:
+            candidate = json.loads((respuesta or "").strip())
+            if isinstance(candidate, dict):
+                draft_id = candidate.get("draftId") or candidate.get("id")
+        except (TypeError, json.JSONDecodeError):
+            pass
+
+    if not draft_id:
+        registrar_auditoria_gmail_fallo(
+            "gmail_create_draft_verification_missing_draft_id",
+            parametros,
+        )
+        return {
+            "status": "failed",
+            "reason": "gmail_create_draft_verification_missing_draft_id",
+            "parameters": parametros,
+            "response": respuesta,
+        }, session_id
+
+    # Independent read-back verification by exact draft ID.
+    verification = verificar_gmail_draft_claude(draft_id, parametros, system)
+
+    if verification.get("status") != "verified":
+        registrar_auditoria_gmail_fallo(
+            verification.get(
+                "reason",
+                "gmail_create_draft_post_write_verification_failed",
+            ),
+            parametros,
+        )
+        return {
+            "status": "failed",
+            "reason": "gmail_create_draft_post_write_verification_failed",
+            "draft_id": draft_id,
+            "verification": verification,
+            "parameters": parametros,
+            "response": respuesta,
+        }, session_id
+
+    registrar_auditoria_gmail(
+        "Gmail draft created and independently verified.",
+        parametros,
+        draft_id=draft_id,
+        status="executed",
+    )
+
+    return {
+        "status": "executed",
+        "reason": "gmail_create_draft_executed_and_verified",
+        "draft_id": draft_id,
+        "parameters": parametros,
+        "response": respuesta,
+        "verification": verification,
+    }, session_id
 
 
 
@@ -5539,6 +6104,35 @@ IMPORTANT:
                                 print(
                                     f"Calendar deletion ended with status: "
                                     f"{calendar_result.get('status', 'unknown')}"
+                                )
+                            pending_action = None
+                            continue
+
+                        if (
+                            pending_action.get("intent") == "email"
+                            and pending_action.get("action") == "create_draft"
+                        ):
+                            gmail_result, session_id = ejecutar_gmail_create_draft(
+                                pending_action,
+                                system,
+                                session_id,
+                                execute=True,
+                            )
+                            print(f"gmail > {gmail_result.get('status')}")
+                            print(
+                                f"gmail_reason > "
+                                f"{gmail_result.get('reason', '')}"
+                            )
+                            if gmail_result.get("status") == "executed":
+                                print("Gmail draft created.")
+                            elif gmail_result.get("status") == "blocked":
+                                print("Gmail draft blocked by safety gate.")
+                            elif gmail_result.get("status") == "failed":
+                                print("Gmail draft creation failed.")
+                            else:
+                                print(
+                                    f"Gmail draft ended with status: "
+                                    f"{gmail_result.get('status', 'unknown')}"
                                 )
                             pending_action = None
                             continue
