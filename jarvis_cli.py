@@ -3299,6 +3299,9 @@ def ejecutar_calendar_delete_event_claude(
     prompt = (
         "EXECUTE ONE APPROVED CALENDAR DELETE.\n\n"
         f"You have explicit approval from {NOMBRE} for exactly this operation.\n"
+        "First, use ToolSearch with query "
+        "'select:mcp__claude_ai_Google_Calendar__delete_event' to load the "
+        "Google Calendar delete_event tool.\n"
         "Use ONLY the Google Calendar delete_event tool.\n"
         "Do not search, create, update, or modify any other event.\n"
         "Do not change, reinterpret, or invent any parameter.\n"
@@ -3306,18 +3309,63 @@ def ejecutar_calendar_delete_event_claude(
         "APPROVED PARAMETERS (JSON):\n"
         f"{json.dumps({'eventId': event_id, 'calendarId': calendar_id}, ensure_ascii=False)}\n\n"
         "Call mcp__claude_ai_Google_Calendar__delete_event exactly once "
-        "with those parameters. After the tool call, return a concise "
-        "confirmation containing the deleted event identifier."
+        "with those parameters. After the tool call, end your response "
+        "with a final line using EXACTLY this format (uppercase DELETED, "
+        "one space after the colon, no Markdown, no backticks, nothing "
+        "else on that line):\n"
+        "DELETED: <event_id>\n"
+        "That line must be the very last line of your response. Only "
+        "output it if the tool call actually reported the event as "
+        "deleted. If the tool call failed or did not confirm deletion, "
+        "do not output a DELETED line at all; instead state explicitly "
+        "that deletion was not confirmed."
+    )
+
+    # Deliberately NOT the full JARVIS persona (`system`, unused below) —
+    # same root cause and same fix as ejecutar_calendar_create_event_claude():
+    # the persona's own "confirm consequential actions in this conversation"
+    # ethos put this isolated worker in conflict with an unavoidable lack of
+    # visible conversational approval, and it refused (live failure,
+    # 2026-09-18). A minimal, self-contained prompt has no such rule to
+    # conflict with in the first place.
+    system_ejecutor = (
+        "You are a single-purpose Calendar-delete execution worker. You "
+        "are not a conversational assistant and have no persona.\n\n"
+        "The OUTER JARVIS process has already completed its own approval "
+        "gate for this exact operation and confirmed it with the user "
+        "before starting you. You have no approval decision to make: do "
+        "not ask for, and do not independently verify, any conversational "
+        "approval — that step already happened outside this process, "
+        "before you existed.\n\n"
+        "APPROVED PARAMETERS (JSON, authoritative — do not modify):\n"
+        f"{json.dumps({'eventId': event_id, 'calendarId': calendar_id}, ensure_ascii=False)}\n\n"
+        "Your task, in order:\n"
+        "1. Use ToolSearch with query "
+        "'select:mcp__claude_ai_Google_Calendar__delete_event' to load "
+        "the Google Calendar delete_event tool.\n"
+        "2. Call mcp__claude_ai_Google_Calendar__delete_event exactly "
+        "once, using the APPROVED PARAMETERS above exactly as given.\n"
+        "3. Do not perform any other tool call or action of any kind.\n\n"
+        "End your response with a final line using EXACTLY this format "
+        "(uppercase DELETED, one space after the colon, no Markdown, no "
+        "backticks, nothing else on that line):\n"
+        "DELETED: <event_id>\n"
+        "That line must be the very last line of your response. Only "
+        "output it if the tool call actually reported the event as "
+        "deleted. If the tool call failed or did not confirm deletion, "
+        "do not output a DELETED line at all; instead state explicitly "
+        "that deletion was not confirmed."
     )
 
     cmd = [
         "claude", "-p", prompt,
         "--output-format", "json",
         "--model", MODEL,
-        "--permission-mode", "auto",
-        "--append-system-prompt", system,
-        "--allowedTools", *CALENDAR_DELETE_TOOLS,
-        "--tools", *CALENDAR_DELETE_TOOLS,
+        "--permission-mode", "bypassPermissions",
+        "--permission-prompts", "none",
+        "--system-prompt", system_ejecutor,
+        "--allowedTools", "ToolSearch", *CALENDAR_DELETE_TOOLS,
+        "--tools", "ToolSearch", *CALENDAR_DELETE_TOOLS,
         "--add-dir", str(VAULT),
     ]
 
